@@ -73,7 +73,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 
 # Optional (PDF parsing)
 pip install pypdf
-
+``
 
 
 2. **Upload or Paste Text**  
