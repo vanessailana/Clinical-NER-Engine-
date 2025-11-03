@@ -62,53 +62,6 @@ These metrics describe **agreement**, **diversity**, and **coverage** — useful
 
 ---
 
-
-
-2. **Upload or Paste Text**  
-Upload `.txt` or `.pdf` notes or paste clinical text (e.g., a discharge summary).
-
-3. **Run NER**  
-Each model runs once per document.  
-Every entity with a confidence score ≥ your chosen threshold is stored in a local SQLite database.
-
-4. **Explore Tabs**  
-View highlights, search results, model comparisons, metrics, consensus, and performance summaries.
-
----
-
-#Metrics Explained
-
-| Metric | What It Measures | Example |
-|--------|------------------|----------|
-| **Dice Similarity** | Agreement between two models (higher = more overlap). | Model A finds `{aspirin, metoprolol}`; Model B finds `{aspirin, furosemide}` → Dice = `2×1 / (2+2)` = **0.5**. |
-| **Jaccard Similarity** | Another overlap score using union instead of total count. | Same example → Jaccard = `1 / 3 ≈ 0.33`. |
-| **Per-Label Overlap** | Overlap but computed per entity type (e.g., only `DRUG`). | Helps see which labels align most across models. |
-| **Type–Token Ratio (TTR)** | Diversity = unique entities ÷ total entities. | 10 entities, 5 unique → TTR = 0.5. Higher = more variety. |
-| **Label Entropy** | How balanced predictions are across labels. | If 90% are `DRUG`, entropy is low (imbalanced). |
-| **Span Length (mean, p50, p90)** | Avg characters per entity. | “asthma” = short; “acute lymphoblastic leukemia” = long. |
-| **Score Stats (mean, p50, p90)** | Confidence distribution per label. | Shows which entities are more confidently predicted. |
-| **Document Density** | Unique `(label, term)` per 1 000 chars. | If 4 unique entities per 1 000 chars → density = 4. |
-| **Threshold Sweep** | Compares metrics at different confidence cutoffs. | At 0.3 → 200 entities; at 0.7 → 90 entities. |
-| **Consensus (Majority / Unanimous)** | Entities agreed on by most or all models. | 2 of 3 models find “asthma” → majority; 3 of 3 → unanimous. |
-| **Latency (p50 / p90 / p99)** | Inference time percentiles (ms). | p50 = median speed; p99 = slowest runs. |
-
-These metrics describe **agreement**, **diversity**, and **coverage** — useful when no human-annotated (“gold”) data exists.
-
----
-
-##Installation
-
-```bash
-# Core dependencies
-pip install streamlit transformers pandas
-
-# Optional (GPU acceleration)
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-# Optional (PDF parsing)
-pip install pypdf
-
-
 ## 🖥️ Tabs Overview
 
 ### 🧪 Process
