@@ -62,18 +62,6 @@ These metrics describe **agreement**, **diversity**, and **coverage** — useful
 
 ---
 
-## Installation
-
-```bash
-# Core dependencies
-pip install streamlit transformers pandas
-
-# Optional (GPU acceleration)
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-# Optional (PDF parsing)
-pip install pypdf
-``
 
 
 2. **Upload or Paste Text**  
