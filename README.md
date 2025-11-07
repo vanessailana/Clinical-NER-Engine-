@@ -38,7 +38,7 @@ Each model runs once per document.
 Every entity with a confidence score ≥ your chosen threshold is stored in a local SQLite database.
 
 4. **Explore Tabs**  
-View highlights, search results, model comparisons, metrics, consensus, and performance summaries.
+View highlights, search results, model comparisons.
 
 ---
 
@@ -79,55 +79,4 @@ These metrics describe **agreement**, **diversity**, and **coverage** — useful
 - Search note content.  
 - Filter by **model**, **label**, or **score**.  
 - Export results as CSV.
-
-### 📊 Benchmark (No-Gold)
-Compare models without ground truth using:
-- **Pairwise Overlap (Dice/Jaccard)**  
-- **Per-Label Overlap**  
-- **Diversity & Entropy**  
-- **Span & Score Stats**  
-- **Document Density**
-
-###  Metrics Dashboard
-- **Quick Compare:** unique terms, TTR, entropy.  
-- **Per-Label Confidence:** p50 / p90 scores.  
-- **Density:** unique terms per 1 000 chars.  
-- **Threshold Sweep:** visualize trade-offs by score cutoff.
-
-###  Consensus
-- Select ≥2 models to find shared entities.  
-- View or download **majority/unanimous** entity sets (CSV).
-
-### Performance
-- Shows model latency: **mean**, **p50**, **p90**, **p99** (ms).
-
----
-
-## Local Database
-
-| Table | Purpose |
-|--------|----------|
-| **documents** | Stores uploaded text (`id`, `name`, `text`) |
-| **entities** | Model outputs (`doc_id`, `model`, `label`, `word`, `score`, `start`, `end`) |
-| **perf_events** | Inference timing (`model`, `phase`, `ms`) |
-
----
-
-## Tips
-- **No chunking:** faster; long notes may exceed model limits.  
-- **No aggregation:** preserves raw spans for higher recall.  
-- **Confidence threshold:** lower = more recall, higher = more precision.  
-- **GPU support:** uses CUDA automatically if available.  
-- **Privacy:** all data stays local in `ner_index.db`.
-
----
-
-##  Why “No-Gold” Evaluation?
-Clinical data often lacks labeled ground truth.  
-This app uses **agreement-based metrics** (Dice, Jaccard, entropy, diversity) instead of accuracy to compare models.
-
-You can identify:
-- Models that over- or under-extract  
-- Imbalanced label distributions  
-- High-agreement “silver-standard” entities across models
 
