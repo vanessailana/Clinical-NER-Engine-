@@ -1,0 +1,6 @@
+streamlit==1.38.0
+pandas==2.2.2
+transformers==4.43.3
+# PyTorch (pick up the right wheel automatically)
+torch==2.2.1
+pypdf==4.2.0
