@@ -1,13 +1,13 @@
 # app.py — Clinical NER (Single-Pass, No Aggregation, No Polarity)
 # ----------------------------------------------------------------
 # - One full inference per document (no chunking)
-# - aggregation_strategy="none"
-# - No polarity hints anywhere
-# - RECALL BOOSTS: ALWAYS ON (normalize, expand dosage tails, merge same-label tokens)
+# - aggregation_strategy="none" (for token-classifiers)
+# - LLM path available via "LLM:<hf_model_id>" entries
+# - RECALL BOOSTS: normalize, expand dosage tails, merge same-label tokens
 # - Overlap-aware highlighting (renders ALL overlapping entities)
 # - Persist-all; confidence is a VIEW-TIME filter only
-# - Duplicate suppression: drop exact dupes and nested same-label spans (keep longest or higher score)
-# - NEW: Per-file×model CSV export + combined CSV export
+# - Duplicate suppression: drop exact dupes and nested same-label spans
+# - Per-file×model CSV export + combined CSV export
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import io
 import re
+import json
 import sqlite3
 import time
 import traceback
@@ -40,7 +41,17 @@ try:
 except Exception:
     HAS_PYPDF = False
 
-from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
+# Hugging Face (local) — no API key required for public models
+try:
+    from transformers import (
+        AutoModelForTokenClassification,
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        pipeline as hf_pipeline,
+    )
+    HAS_TRANSFORMERS = True
+except Exception:
+    HAS_TRANSFORMERS = False
 
 # ------------------------------ Page / Styles ---------------------------------
 st.set_page_config(page_title="Clinical NER — Single-Pass (No-Gold)", layout="wide", page_icon="🩺")
@@ -87,6 +98,18 @@ DOSAGE_TAIL_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+LLM_JSON_INSTR = (
+    "Extract all clinical entities from the note. "
+    "Use labels from this set when applicable: {labels}. "
+    "Return EXACT character offsets over the ORIGINAL text.\n\n"
+    "Respond ONLY with a JSON array of objects of the form:\n"
+    '[{"label": "DRUG|DISEASE|SYMPTOM|ANATOMY|TEST|PROCEDURE", '
+    '"start": <int>, "end": <int>, "text": "<exact substring>"}]\n\n'
+    "Note:\n{note}"
+)
+
+DEFAULT_LABEL_SET = ["DRUG", "DISEASE", "SYMPTOM", "ANATOMY", "TEST", "PROCEDURE"]
+
 # -------------------------------- Utilities -----------------------------------
 def color_for_label(label: str) -> str:
     return ENTITY_COLORS[abs(hash(label)) % len(ENTITY_COLORS)]
@@ -101,7 +124,6 @@ def escape_html(s: str) -> str:
     )
 
 def normalize_text_for_inference(text: str) -> str:
-    # Light normalization to help models: fix unicode, normalize spaces/dashes
     if not text:
         return text
     t = unicodedata.normalize("NFKC", text)
@@ -125,7 +147,6 @@ def sanitize_filename(s: str) -> str:
 
 # --- Span utilities to avoid duplicate highlights ---
 def merge_adjacent_same_label(ents: List[Dict[str, Any]], text: str, max_gap: int = 1) -> List[Dict[str, Any]]:
-    """Merge contiguous/small-gap spans with the same label to improve recall on tokenized outputs."""
     if not ents:
         return []
     ents = sorted(ents, key=lambda e: (int(e["start"]), int(e["end"])))
@@ -146,7 +167,6 @@ def merge_adjacent_same_label(ents: List[Dict[str, Any]], text: str, max_gap: in
     return merged
 
 def dedup_spans_exact(ents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Remove exact duplicates: same (start, end, label). Normalize to `entity_group` key."""
     seen: Set[Tuple[int,int,str]] = set()
     out: List[Dict[str, Any]] = []
     for e in ents:
@@ -160,10 +180,6 @@ def dedup_spans_exact(ents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 def suppress_nested_same_label(ents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Drop spans fully contained within another span of the SAME label.
-    Keep the longer (or higher-score if equal length).
-    """
     if not ents:
         return []
     by_label: Dict[str, List[Dict[str, Any]]] = {}
@@ -185,7 +201,6 @@ def suppress_nested_same_label(ents: List[Dict[str, Any]]) -> List[Dict[str, Any
     return dedup_spans_exact(kept)
 
 def build_segments_with_overlaps(text: str, ents: List[Dict[str, Any]]) -> List[Tuple[int,int,List[Dict[str,Any]]]]:
-    """Partition text into non-overlapping segments; each segment has zero or more covering entities."""
     n = len(text)
     if not ents or n == 0:
         return [(0, n, [])]
@@ -289,12 +304,118 @@ def sql_many(sql: str, rows: Sequence[Sequence[Any]]) -> None:
     CONN.executemany(sql, rows)
     CONN.commit()
 
+# ------------------------------ LLM Helpers -----------------------------------
+def is_llm_entry(model_name: str) -> bool:
+    """Detect 'LLM:<hf_id>' prefix to route to the LLM JSON extractor."""
+    return bool(re.match(r"^\s*LLM\s*:\s*", model_name))
+
+def llm_model_id(model_name: str) -> str:
+    """Strip 'LLM:' prefix and return the Hugging Face model id."""
+    return re.sub(r"^\s*LLM\s*:\s*", "", model_name).strip()
+
+def extract_json_list(s: str) -> List[Dict[str, Any]]:
+    """
+    Robustly extract a JSON array from LLM text. Handles ```json blocks or stray text.
+    """
+    if not s:
+        return []
+    # Prefer fenced code blocks
+    fence = re.search(r"```json\s*(\[.*?\])\s*```", s, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        s = fence.group(1)
+    else:
+        # Fallback: first top-level array
+        arr = re.search(r"\[\s*{.*}\s*\]", s, flags=re.DOTALL)
+        if arr:
+            s = arr.group(0)
+    try:
+        data = json.loads(s)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        return []
+    return []
+
+def llm_ner_pipeline_factory(hf_id: str):
+    """
+    Returns a callable(text) -> list[dict(label, word, score, start, end)]
+    using a causal LLM with a JSON extraction prompt.
+    """
+    if not HAS_TRANSFORMERS:
+        raise RuntimeError("Transformers not available. pip install transformers accelerate")
+
+    try:
+        tok = AutoTokenizer.from_pretrained(hf_id)
+        mdl = AutoModelForCausalLM.from_pretrained(hf_id)
+        gen = hf_pipeline(
+            "text-generation",
+            model=mdl,
+            tokenizer=tok,
+            device=_device_index(),
+        )
+    except Exception as ex:
+        raise RuntimeError(f"Failed to load LLM '{hf_id}': {ex}")
+
+    labels_str = ", ".join(DEFAULT_LABEL_SET)
+
+    def _call(text: str) -> List[Dict[str, Any]]:
+        note = text if isinstance(text, str) else str(text or "")
+        prompt = LLM_JSON_INSTR.format(labels=labels_str, note=note)
+        try:
+            out = gen(prompt, max_new_tokens=512, do_sample=False, temperature=0.0)[0]["generated_text"]
+        except Exception as ex:
+            # Generate may include the prompt; if so, keep only completion tail
+            out = f"[]  /* generation error: {ex} */"
+
+        items = extract_json_list(out)
+        ents: List[Dict[str, Any]] = []
+
+        for it in items:
+            label = str(it.get("label", "")).strip() or "ENTITY"
+            text_piece = str(it.get("text", "") or it.get("word", "") or "")
+            start = it.get("start", None)
+            end = it.get("end", None)
+
+            # If offsets missing but we have text, try to locate first occurrence
+            if (start is None or end is None) and text_piece:
+                idx = note.find(text_piece)
+                if idx >= 0:
+                    start, end = idx, idx + len(text_piece)
+
+            # Validate offsets
+            if isinstance(start, int) and isinstance(end, int) and 0 <= start < end <= len(note):
+                ents.append({
+                    "entity_group": label,
+                    "word": note[start:end],
+                    "score": 0.99,   # pseudo-confidence for LLM path
+                    "start": start,
+                    "end": end,
+                })
+            # else: skip invalid rows silently
+
+        return ents
+
+    return _call
+
 # ------------------------------ Models / Pipelines ----------------------------
 @st.cache_resource(show_spinner=False)
 def load_pipeline(model_name: str):
-    # Always no aggregation
+    """
+    Returns a callable pipeline with signature: pipeline(text) -> list[dict(entity|label, word, score, start, end)]
+    Supports:
+      • HF token-classification models (aggregation_strategy=None)
+      • LLM JSON extractor via entries like 'LLM:<hf_model_id>'
+    """
+    if not HAS_TRANSFORMERS:
+        raise RuntimeError("Transformers is not available. Please install it: pip install transformers accelerate")
+
+    # LLM route (prompted JSON extractor)
+    if is_llm_entry(model_name):
+        return llm_ner_pipeline_factory(llm_model_id(model_name))
+
+    # Token-classifier route
     try:
-        return pipeline(
+        return hf_pipeline(
             "token-classification",
             model=model_name,
             aggregation_strategy="none",
@@ -303,7 +424,7 @@ def load_pipeline(model_name: str):
     except Exception:
         tok = AutoTokenizer.from_pretrained(model_name)
         mdl = AutoModelForTokenClassification.from_pretrained(model_name, ignore_mismatched_sizes=True)
-        return pipeline(
+        return hf_pipeline(
             "token-classification",
             model=mdl,
             tokenizer=tok,
@@ -343,10 +464,11 @@ def run_ner_single_pass(pipe, text: str) -> List[Dict[str, Any]]:
     if not ok or not outs:
         return []
 
+    # Normalize outputs to a common schema with entity_group
     results: List[Dict[str, Any]] = []
     for o in outs:
         ent = {
-            "entity_group": o.get("entity_group") or o.get("entity") or "",
+            "entity_group": o.get("entity_group") or o.get("entity") or o.get("label") or "",
             "word": o.get("word", ""),
             "score": float(o.get("score", 0.0)),
             "start": int(o.get("start", 0)),
@@ -359,7 +481,7 @@ def run_ner_single_pass(pipe, text: str) -> List[Dict[str, Any]]:
     # ALWAYS merge contiguous tokens of same label
     results = merge_adjacent_same_label(results, text_in, max_gap=1)
 
-    # Suppress exact dups and nested same-label spans to avoid double-highlights
+    # Suppress exact dups and nested same-label spans
     results = suppress_nested_same_label(dedup_spans_exact(results))
 
     # Map words back to original (pre-normalization) text for rendering
@@ -377,18 +499,31 @@ def sidebar_settings():
     st.sidebar.subheader("Settings")
 
     default_models = "\n".join([
+        # HF token-classification models (download once; no API key required)
         "d4data/biomedical-ner-all",
         "dslim/bert-base-NER",
-        "Jean-Baptiste/camembert-ner"
+        "kamalkraj/BioClinicalBERT-NER"
+        "Jean-Baptiste/camembert-ner",
+        "emilyalsentzer/Bio_ClinicalBERT",
+        "Helios9/BIOMed_NER",
+        "HUMADEX/english_medical_ner"
+       
     ])
-    models_raw = st.sidebar.text_area("Models (one per line)", default_models, height=90, key="sb_models")
+    models_raw = st.sidebar.text_area(
+        "Models (one per line)",
+        default_models,
+        height=140,
+        key="sb_models",
+        help="Token-classifiers run directly. For a prompted clinical LLM extractor, write LLM:<hf_model_id> (e.g., LLM:epfl-llm/meditron-7b).",
+    )
     model_list = dedup_order([canonical_model_name(m) for m in models_raw.splitlines() if m.strip()])
     st.sidebar.caption(f"👀 Distinct models loaded: {len(model_list)}")
 
     conf = st.sidebar.slider("Min confidence (view only)", 0.0, 1.0, 0.50, 0.01, key="sb_conf")
-
     enable_pdf = st.sidebar.checkbox("Enable PDF parsing", value=HAS_PYPDF, key="sb_pdf")
     st.sidebar.caption(f"CUDA available: {torch.cuda.is_available() if HAS_TORCH else False}")
+    if not HAS_TRANSFORMERS:
+        st.sidebar.error("Transformers not installed. Run: pip install transformers accelerate")
 
     return {
         "models": model_list,
@@ -496,7 +631,8 @@ def tab_process_ui(cfg: Dict[str, Any]):
             m_canon = canonical_model_name(m)
             m_slug = sanitize_filename(m_canon)
             with st.expander(f"Results — {name} — `{m_canon}`", expanded=False):
-                st.write(f"Loading `{m_canon}` (single-pass, aggregation='none')…")
+                mode = "LLM JSON extractor" if is_llm_entry(m_canon) else "token-classification (aggregation='none')"
+                st.write(f"Loading `{m_canon}` — {mode}…")
                 try:
                     pipe = load_pipeline(m_canon)
                 except Exception as ex:
@@ -698,42 +834,65 @@ def tab_search_ui():
         else:
             ents_list = df.to_dict(orient="records")
             ents_list = suppress_nested_same_label(dedup_spans_exact(ents_list))
-            df_show = pd.DataFrame(ents_list)
+            df_show = pd.DataFrame(ents_list).rename(columns={"name": "file_name"})
             st.dataframe(df_show, use_container_width=True)
-            st.download_button("⬇️ Download CSV", df_show.to_csv(index=False).encode("utf-8"),
-                               file_name="search_results.csv", mime="text/csv")
+            st.download_button(
+                "⬇️ Download search results (CSV)",
+                df_show.to_csv(index=False).encode("utf-8"),
+                "ner_search_results.csv",
+                "text/csv",
+                key="dl_search_csv"
+            )
 
-def quick_peek_ui():
-    st.markdown("---")
-    st.markdown("#### Quick peek: what’s in the index right now?")
-    try:
-        df_docs = sql_df("SELECT id, name, LENGTH(text) AS n_chars FROM documents ORDER BY id DESC LIMIT 50")
-        df_ents = sql_df(
-            """
-            SELECT e.model, e.label, e.word, COUNT(*) AS n
-            FROM entities e
-            GROUP BY e.model, e.label, e.word
-            ORDER BY n DESC, e.model, e.label, e.word
-            LIMIT 50
-            """
+def tab_analytics_ui():
+    st.markdown("#### Analytics")
+    if CONN.execute("SELECT COUNT(*) FROM perf_events").fetchone()[0] == 0:
+        st.info("Process at least one note in the **Process** tab to see analytics.")
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Inference performance (ms)**")
+        df_perf = sql_df(
+            "SELECT model, ms FROM perf_events WHERE phase='infer'"
         )
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Documents (latest 50)**"); st.dataframe(df_docs, use_container_width=True, height=260)
-        with c2:
-            st.markdown("**Top entities (latest 50)**"); st.dataframe(df_ents, use_container_width=True, height=260)
-    except Exception as ex:
-        st.error(f"Quick peek error: {ex}")
+        perf_agg = df_perf.groupby("model")["ms"].agg(["mean", "median", "count"]).sort_values("mean")
+        st.dataframe(perf_agg, use_container_width=True)
 
-# --------------------------------- Main App -----------------------------------
-cfg = sidebar_settings()
+    with c2:
+        st.markdown("**Entity counts by label & model**")
+        df_counts = sql_df(
+            "SELECT model, label, COUNT(*) AS count FROM entities GROUP BY 1, 2 ORDER BY 1, 2"
+        )
+        counts_pivot = df_counts.pivot_table(index="label", columns="model", values="count").fillna(0).astype(int)
+        st.dataframe(counts_pivot, use_container_width=True)
 
-tab_process, tab_highlight, tab_search = st.tabs(
-    ["🧪 Process", "🖍️ Highlights", "🔎 Search"]
-)
+    st.markdown("**Confidence score distributions (P50 / P90 / Max)**")
+    df_scores = sql_df("SELECT model, label, score FROM entities")
+    score_agg = df_scores.groupby(["model", "label"])["score"].agg([
+        "count",
+        lambda x: pct_list(list(x), 0.5),
+        lambda x: pct_list(list(x), 0.9),
+        "max",
+    ]).rename(columns={"<lambda_0>": "median", "<lambda_1>": "p90"})
+    st.dataframe(score_agg, use_container_width=True)
 
-with tab_process:   tab_process_ui(cfg)
-with tab_highlight: tab_highlight_ui()
-with tab_search:    tab_search_ui()
 
-quick_peek_ui()
+# -------------------------------- Main ----------------------------------------
+def main():
+    cfg = sidebar_settings()
+
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["Process", "Highlight", "Search", "Analytics"]
+    )
+    with tab1:
+        tab_process_ui(cfg)
+    with tab2:
+        tab_highlight_ui()
+    with tab3:
+        tab_search_ui()
+    with tab4:
+        tab_analytics_ui()
+
+if __name__ == "__main__":
+    main()
